@@ -250,11 +250,11 @@ async fn move_file(
     .await
     .map_err(|err| internal_error(err, "persist uploaded file metadata"))?;
 
-    let _sync_token = db::record_change(
+    let _sync_token = db::record_existing_file_change(
         &state.db,
         owner,
-        record.id,
         &destination,
+        &record,
         if target_existed { "modify" } else { "create" },
     )
     .await

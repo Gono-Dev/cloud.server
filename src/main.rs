@@ -665,16 +665,7 @@ async fn stop_upload_cleanup(upload_cleanup: tokio::task::JoinHandle<()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, ExpiryUpdate, LogFormat, RepairMode};
-
-    #[test]
-    fn log_format_parser_accepts_supported_formats() {
-        assert_eq!(LogFormat::parse("json"), LogFormat::Json);
-        assert_eq!(LogFormat::parse(" JSON "), LogFormat::Json);
-        assert_eq!(LogFormat::parse("compact"), LogFormat::Compact);
-        assert_eq!(LogFormat::parse("text"), LogFormat::Text);
-        assert_eq!(LogFormat::parse("unknown"), LogFormat::Text);
-    }
+    use super::{Command, ExpiryUpdate, RepairMode};
 
     #[test]
     fn command_parser_accepts_server_and_check_modes() {

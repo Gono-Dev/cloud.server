@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::ErrorKind,
     path::{Path, PathBuf},
     sync::Arc,
@@ -86,9 +87,41 @@ async fn handle_sync_collection(
 ) -> anyhow::Result<Response<Body>> {
     let started = Instant::now();
     let owner = &principal.username;
-    let current_token = db::current_sync_token(&state.db, owner).await?;
     let since_token = report.sync_token.unwrap_or(0);
-    let floor_token = db::change_log_floor_token(&state.db, owner, current_token).await?;
+
+    if since_token == 0 {
+        let snapshot = db::initial_sync_snapshot(&state.db, owner, &state.instance_id).await?;
+        let current_token = snapshot.current_token;
+        let mut xml = multistatus_start();
+        let entry_count = append_initial_snapshot_response(
+            &mut xml,
+            &state,
+            principal,
+            files_root,
+            href_prefix,
+            snapshot.records,
+        )
+        .await?;
+
+        xml.push_str("<d:sync-token>");
+        xml.push_str(&current_token.to_string());
+        xml.push_str("</d:sync-token></d:multistatus>");
+
+        debug!(
+            owner,
+            since_token,
+            current_token,
+            entry_count,
+            elapsed_ms = format_args!("{:.3}", started.elapsed().as_secs_f64() * 1000.0),
+            "sync-collection initial snapshot completed"
+        );
+
+        return Ok(xml_response(xml));
+    }
+
+    let snapshot = db::change_log_range_snapshot(&state.db, owner, since_token).await?;
+    let current_token = snapshot.current_token;
+    let floor_token = snapshot.floor_token;
     if since_token < floor_token {
         debug!(
             owner,
@@ -105,7 +138,7 @@ async fn handle_sync_collection(
         ));
     }
 
-    let entries = db::list_change_log_range(&state.db, owner, since_token, current_token).await?;
+    let entries = fold_change_log_entries(snapshot.entries);
     let entry_count = entries.len();
     let mut xml = multistatus_start();
 
@@ -129,6 +162,68 @@ async fn handle_sync_collection(
     );
 
     Ok(xml_response(xml))
+}
+
+async fn append_initial_snapshot_response(
+    xml: &mut String,
+    state: &AppState,
+    principal: &Principal,
+    files_root: &Path,
+    href_prefix: &str,
+    records: Vec<db::IndexedFileRecord>,
+) -> anyhow::Result<usize> {
+    let owner = &principal.username;
+    let mut returned_count = 0_usize;
+
+    for candidate in records {
+        let rel_path = Path::new(&candidate.rel_path);
+        let Some(client_rel_path) = permissions::storage_path_to_client_path(principal, rel_path)?
+        else {
+            continue;
+        };
+        let Ok(abs_path) = storage::safe_existing_path(files_root, rel_path) else {
+            continue;
+        };
+        let metadata = match std::fs::metadata(&abs_path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                error!(
+                    ?err,
+                    rel_path = %candidate.rel_path,
+                    "failed to read initial sync snapshot metadata"
+                );
+                continue;
+            }
+        };
+        let record = db::ensure_file_record(
+            &state.db,
+            db::FileRecordInput {
+                owner,
+                rel_path,
+                abs_path: &abs_path,
+                instance_id: &state.instance_id,
+                xattr_ns: &state.xattr_ns,
+            },
+        )
+        .await?;
+        let href_rel_path = storage::rel_path_string(&client_rel_path)?;
+        append_resource_response(xml, href_prefix, &href_rel_path, &record, metadata.is_dir());
+        returned_count += 1;
+    }
+
+    Ok(returned_count)
+}
+
+fn fold_change_log_entries(entries: Vec<db::ChangeLogEntry>) -> Vec<db::ChangeLogEntry> {
+    let mut latest_by_path = BTreeMap::new();
+    for entry in entries {
+        latest_by_path.insert(entry.rel_path.clone(), entry);
+    }
+
+    let mut folded = latest_by_path.into_values().collect::<Vec<_>>();
+    folded.sort_by_key(|entry| entry.sync_token);
+    folded
 }
 
 fn stale_sync_token_response(

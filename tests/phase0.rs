@@ -3556,6 +3556,76 @@ async fn report_sync_collection_returns_changes_since_old_token() {
 }
 
 #[tokio::test]
+async fn report_sync_collection_folds_incremental_changes_to_latest_path_state() {
+    let (app, _temp, password, state) = app_with_state().await;
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/remote.php/dav/sync-fold.txt")
+                .header(header::AUTHORIZATION, auth_header(&password))
+                .body(Body::from("first"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(put.status().is_success());
+    let after_first = db::current_sync_token(&state.db, BOOTSTRAP_USER)
+        .await
+        .expect("token after first put");
+
+    let modify = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/remote.php/dav/sync-fold.txt")
+                .header(header::AUTHORIZATION, auth_header(&password))
+                .body(Body::from("second"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(modify.status().is_success());
+
+    let delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/remote.php/dav/sync-fold.txt")
+                .header(header::AUTHORIZATION, auth_header(&password))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(delete.status().is_success());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::from_bytes(b"REPORT").unwrap())
+                .uri("/remote.php/dav/")
+                .header(header::AUTHORIZATION, auth_header(&password))
+                .header(header::CONTENT_TYPE, "application/xml")
+                .body(Body::from(sync_collection_body(&after_first.to_string())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert_eq!(body.matches("/remote.php/dav/sync-fold.txt").count(), 1);
+    assert!(body.contains("HTTP/1.1 404 Not Found"));
+    assert!(!body.contains("HTTP/1.1 200 OK"));
+}
+
+#[tokio::test]
 async fn report_sync_collection_rejects_pruned_sync_tokens() {
     let (app, _temp, password, state) = app_with_config(|config| {
         config.sync.change_log_retention_days = 0;
@@ -3599,6 +3669,7 @@ async fn report_sync_collection_rejects_pruned_sync_tokens() {
         .await
         .unwrap();
     assert!(response.status().is_success());
+    state.compact_change_log_for_owner(BOOTSTRAP_USER).await;
 
     let changes = db::list_change_log(&state.db, BOOTSTRAP_USER)
         .await
@@ -3741,7 +3812,7 @@ async fn report_sync_collection_marks_deleted_paths_not_found() {
 }
 
 #[tokio::test]
-async fn report_sync_collection_marks_superseded_create_as_not_found() {
+async fn report_sync_collection_initial_snapshot_skips_superseded_history() {
     let (app, _temp, password, _state) = app_with_state().await;
     let put = app
         .clone()
@@ -3787,12 +3858,9 @@ async fn report_sync_collection_marks_superseded_create_as_not_found() {
     assert_eq!(response.status(), StatusCode::MULTI_STATUS);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = std::str::from_utf8(&body).unwrap();
-    assert_eq!(
-        body.matches("/remote.php/dav/sync-create-then-delete.txt")
-            .count(),
-        2
-    );
-    assert!(body.matches("HTTP/1.1 404 Not Found").count() >= 2);
+    assert!(!body.contains("/remote.php/dav/sync-create-then-delete.txt"));
+    assert!(!body.contains("HTTP/1.1 404 Not Found"));
+    assert!(body.contains("<d:sync-token>2</d:sync-token>"));
 }
 
 #[tokio::test]

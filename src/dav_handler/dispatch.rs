@@ -420,7 +420,7 @@ impl NcDavService {
                 return metadata_error_response();
             };
             return match self
-                .record_change(owner, source_record.id, &source_rel, "delete")
+                .record_deleted_change(owner, source_record.id, &source_rel)
                 .await
             {
                 Ok(_) => response,
@@ -495,7 +495,7 @@ impl NcDavService {
                 return metadata_error_response();
             };
             if let Err(response) = self
-                .record_change(owner, source_record.id, &source_rel, "delete")
+                .record_deleted_change(owner, source_record.id, &source_rel)
                 .await
             {
                 return response;
@@ -509,7 +509,7 @@ impl NcDavService {
             _ => "modify",
         };
         if let Err(response) = self
-            .record_change(owner, record.id, &target_rel, operation)
+            .record_existing_change(owner, &target_rel, &record, operation)
             .await
         {
             return response;
@@ -591,7 +591,7 @@ impl NcDavService {
                         error!(?err, rel_path = %current.display(), "failed to persist auto-mkcol parent metadata");
                         metadata_error_response()
                     })?;
-                    self.record_change(owner, record.id, &current, "create")
+                    self.record_existing_change(owner, &current, &record, "create")
                         .await?;
                 }
             }
@@ -714,7 +714,7 @@ impl NcDavService {
             }
         };
         match self
-            .record_change(owner, record.id, &rel_path, "modify")
+            .record_existing_change(owner, &rel_path, &record, "modify")
             .await
         {
             Ok(_) => response,
@@ -743,14 +743,35 @@ impl NcDavService {
         .await
     }
 
-    async fn record_change(
+    async fn record_existing_change(
+        &self,
+        owner: &str,
+        rel_path: &Path,
+        record: &db::FileRecord,
+        operation: &str,
+    ) -> Result<i64, Response<Body>> {
+        let sync_token =
+            db::record_existing_file_change(&self.state.db, owner, rel_path, record, operation)
+                .await
+                .map_err(|err| {
+                    error!(?err, "failed to record WebDAV change");
+                    metadata_error_response()
+                })?;
+        self.state
+            .notify_file_changed_for_owner(owner, Some(record.id));
+        self.state
+            .compact_change_log_for_owner_throttled(owner)
+            .await;
+        Ok(sync_token)
+    }
+
+    async fn record_deleted_change(
         &self,
         owner: &str,
         file_id: i64,
         rel_path: &Path,
-        operation: &str,
     ) -> Result<i64, Response<Body>> {
-        let sync_token = db::record_change(&self.state.db, owner, file_id, rel_path, operation)
+        let sync_token = db::record_deleted_file_change(&self.state.db, owner, file_id, rel_path)
             .await
             .map_err(|err| {
                 error!(?err, "failed to record WebDAV change");

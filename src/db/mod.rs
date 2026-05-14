@@ -1381,6 +1381,19 @@ pub struct ChangeLogEntry {
     pub sync_token: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialSyncSnapshot {
+    pub current_token: i64,
+    pub records: Vec<IndexedFileRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangeLogRangeSnapshot {
+    pub current_token: i64,
+    pub floor_token: i64,
+    pub entries: Vec<ChangeLogEntry>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChangeLogPruneOutcome {
     pub deleted_rows: u64,
@@ -1401,7 +1414,128 @@ pub async fn record_change(
         .begin()
         .await
         .context("begin record_change transaction")?;
+    let token =
+        insert_change_log_with_token(&mut tx, owner, file_id, &rel_path, operation, now).await?;
 
+    tx.commit()
+        .await
+        .context("commit record_change transaction")?;
+    Ok(token)
+}
+
+pub async fn record_existing_file_change(
+    pool: &SqlitePool,
+    owner: &str,
+    rel_path: &Path,
+    record: &FileRecord,
+    operation: &str,
+) -> anyhow::Result<i64> {
+    let rel_path = storage::rel_path_string(rel_path)?;
+    let now = unix_timestamp();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin existing file change transaction")?;
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE file_ids
+        SET etag = ?1,
+            permissions = ?2,
+            favorite = ?3,
+            mtime_ns = ?4,
+            file_size = ?5
+        WHERE owner = ?6 AND rel_path = ?7 AND id = ?8
+        "#,
+    )
+    .bind(&record.etag)
+    .bind(record.permissions)
+    .bind(if record.favorite { 1 } else { 0 })
+    .bind(record.mtime_ns)
+    .bind(record.file_size)
+    .bind(owner)
+    .bind(&rel_path)
+    .bind(record.id)
+    .execute(&mut *tx)
+    .await
+    .context("update file index for existing change")?
+    .rows_affected();
+    if updated == 0 {
+        return Err(anyhow!(
+            "file index row missing for existing change: owner={owner}, rel_path={rel_path}"
+        ));
+    }
+
+    let token =
+        insert_change_log_with_token(&mut tx, owner, record.id, &rel_path, operation, now).await?;
+
+    tx.commit()
+        .await
+        .context("commit existing file change transaction")?;
+    Ok(token)
+}
+
+pub async fn record_deleted_file_change(
+    pool: &SqlitePool,
+    owner: &str,
+    file_id: i64,
+    rel_path: &Path,
+) -> anyhow::Result<i64> {
+    let rel_path = storage::rel_path_string(rel_path)?;
+    let prefix = if rel_path.is_empty() {
+        "%".to_owned()
+    } else {
+        format!("{rel_path}/%")
+    };
+    let now = unix_timestamp();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin deleted file change transaction")?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM file_ids
+        WHERE owner = ?1 AND (rel_path = ?2 OR rel_path LIKE ?3)
+        "#,
+    )
+    .bind(owner)
+    .bind(&rel_path)
+    .bind(&prefix)
+    .execute(&mut *tx)
+    .await
+    .context("delete file index rows for deleted change")?;
+
+    sqlx::query(
+        r#"
+        DELETE FROM dead_props
+        WHERE owner = ?1 AND (rel_path = ?2 OR rel_path LIKE ?3)
+        "#,
+    )
+    .bind(owner)
+    .bind(&rel_path)
+    .bind(&prefix)
+    .execute(&mut *tx)
+    .await
+    .context("delete dead props for deleted change")?;
+
+    let token =
+        insert_change_log_with_token(&mut tx, owner, file_id, &rel_path, "delete", now).await?;
+
+    tx.commit()
+        .await
+        .context("commit deleted file change transaction")?;
+    Ok(token)
+}
+
+async fn insert_change_log_with_token(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    owner: &str,
+    file_id: i64,
+    rel_path: &str,
+    operation: &str,
+    changed_at: i64,
+) -> anyhow::Result<i64> {
     let (token,): (i64,) = sqlx::query_as(
         r#"
         INSERT INTO sync_tokens(owner, token) VALUES(?1, 1)
@@ -1410,7 +1544,7 @@ pub async fn record_change(
         "#,
     )
     .bind(owner)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .context("allocate sync token")?;
 
@@ -1425,14 +1559,11 @@ pub async fn record_change(
     .bind(rel_path)
     .bind(operation)
     .bind(token)
-    .bind(now)
-    .execute(&mut *tx)
+    .bind(changed_at)
+    .execute(&mut **tx)
     .await
     .context("insert change_log row")?;
 
-    tx.commit()
-        .await
-        .context("commit record_change transaction")?;
     Ok(token)
 }
 
@@ -1446,6 +1577,53 @@ pub async fn current_sync_token(pool: &SqlitePool, owner: &str) -> anyhow::Resul
         .transpose()?
         .unwrap_or(0);
     Ok(token)
+}
+
+pub async fn initial_sync_snapshot(
+    pool: &SqlitePool,
+    owner: &str,
+    instance_id: &str,
+) -> anyhow::Result<InitialSyncSnapshot> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin initial sync snapshot transaction")?;
+
+    let current_token = sqlx::query("SELECT token FROM sync_tokens WHERE owner = ?1")
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load current sync token for initial snapshot")?
+        .map(|row| row.try_get::<i64, _>("token"))
+        .transpose()?
+        .unwrap_or(0);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT id, rel_path, etag, permissions, favorite, mtime_ns, file_size
+        FROM file_ids
+        WHERE owner = ?1
+        ORDER BY rel_path
+        "#,
+    )
+    .bind(owner)
+    .fetch_all(&mut *tx)
+    .await
+    .context("list indexed file records for initial snapshot")?;
+
+    tx.commit()
+        .await
+        .context("commit initial sync snapshot transaction")?;
+
+    let records = rows
+        .into_iter()
+        .map(|row| indexed_file_record_from_row(row, instance_id))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    Ok(InitialSyncSnapshot {
+        current_token,
+        records,
+    })
 }
 
 pub async fn change_log_floor_token(
@@ -1469,6 +1647,76 @@ pub async fn change_log_floor_token(
     Ok(min_retained
         .map(|token| token.saturating_sub(1))
         .unwrap_or(current_token))
+}
+
+pub async fn change_log_range_snapshot(
+    pool: &SqlitePool,
+    owner: &str,
+    since_token: i64,
+) -> anyhow::Result<ChangeLogRangeSnapshot> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin change log range snapshot transaction")?;
+
+    let current_token = sqlx::query("SELECT token FROM sync_tokens WHERE owner = ?1")
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("load current sync token for change range")?
+        .map(|row| row.try_get::<i64, _>("token"))
+        .transpose()?
+        .unwrap_or(0);
+
+    let min_retained: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT MIN(sync_token)
+        FROM change_log
+        WHERE owner = ?1 AND sync_token <= ?2
+        "#,
+    )
+    .bind(owner)
+    .bind(current_token)
+    .fetch_one(&mut *tx)
+    .await
+    .context("load change_log floor token for change range")?;
+
+    let floor_token = min_retained
+        .map(|token| token.saturating_sub(1))
+        .unwrap_or(current_token);
+
+    let entries = if since_token < floor_token {
+        Vec::new()
+    } else {
+        let rows = sqlx::query(
+            r#"
+            SELECT file_id, rel_path, operation, sync_token
+            FROM change_log
+            WHERE owner = ?1 AND sync_token > ?2 AND sync_token <= ?3
+            ORDER BY sync_token ASC
+            "#,
+        )
+        .bind(owner)
+        .bind(since_token)
+        .bind(current_token)
+        .fetch_all(&mut *tx)
+        .await
+        .context("list change_log rows for change range")?;
+
+        rows.into_iter()
+            .map(change_log_entry_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?
+    };
+
+    tx.commit()
+        .await
+        .context("commit change log range snapshot transaction")?;
+
+    Ok(ChangeLogRangeSnapshot {
+        current_token,
+        floor_token,
+        entries,
+    })
 }
 
 pub async fn prune_change_log(
@@ -1563,16 +1811,16 @@ pub async fn list_change_log_range(
     .await
     .context("list change_log rows")?;
 
-    rows.into_iter()
-        .map(|row| {
-            Ok(ChangeLogEntry {
-                file_id: row.try_get("file_id")?,
-                rel_path: row.try_get("rel_path")?,
-                operation: row.try_get("operation")?,
-                sync_token: row.try_get("sync_token")?,
-            })
-        })
-        .collect()
+    rows.into_iter().map(change_log_entry_from_row).collect()
+}
+
+fn change_log_entry_from_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<ChangeLogEntry> {
+    Ok(ChangeLogEntry {
+        file_id: row.try_get("file_id")?,
+        rel_path: row.try_get("rel_path")?,
+        operation: row.try_get("operation")?,
+        sync_token: row.try_get("sync_token")?,
+    })
 }
 
 const UPLOAD_SESSION_TTL_SECS: i64 = 24 * 60 * 60;
