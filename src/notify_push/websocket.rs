@@ -11,12 +11,23 @@ use super::{NotifyClientInfo, NotifyRuntime, PushMessage, UpdatedFiles};
 
 const CLIENT_INFO_PREFIX: &str = "gono_client_info ";
 
+#[derive(Debug)]
+pub struct WebSocketRequestContext {
+    pub peer_addr: String,
+    pub user_agent: Option<String>,
+    pub origin: Option<String>,
+    pub host: Option<String>,
+    pub x_forwarded_for: Option<String>,
+    pub forwarded: Option<String>,
+}
+
 pub async fn handle_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
     runtime: Arc<NotifyRuntime>,
-    peer_addr: String,
+    request_context: WebSocketRequestContext,
 ) {
+    let peer_addr = request_context.peer_addr.clone();
     let principal = match time::timeout(
         runtime.auth_timeout(),
         authenticate(&mut socket, &state, &runtime),
@@ -26,13 +37,30 @@ pub async fn handle_socket(
         Ok(Ok(user)) => user,
         Ok(Err(message)) => {
             runtime.auth_failed();
-            warn!(%peer_addr, message, "notify_push websocket authentication failed");
+            warn!(
+                %peer_addr,
+                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+                origin = request_context.origin.as_deref().unwrap_or(""),
+                host = request_context.host.as_deref().unwrap_or(""),
+                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+                message,
+                "notify_push websocket authentication failed"
+            );
             let _ = socket.send(Message::text(format!("err: {message}"))).await;
             return;
         }
         Err(_) => {
             runtime.auth_failed();
-            warn!(%peer_addr, "notify_push websocket authentication timed out");
+            warn!(
+                %peer_addr,
+                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+                origin = request_context.origin.as_deref().unwrap_or(""),
+                host = request_context.host.as_deref().unwrap_or(""),
+                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+                "notify_push websocket authentication timed out"
+            );
             let _ = socket
                 .send(Message::text("err: Authentication timeout"))
                 .await;
@@ -45,7 +73,16 @@ pub async fn handle_socket(
         Ok(receiver) => receiver,
         Err(SubscribeError::LimitExceeded) => {
             runtime.auth_failed();
-            warn!(%peer_addr, user, "notify_push websocket connection limit exceeded");
+            warn!(
+                %peer_addr,
+                user,
+                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+                origin = request_context.origin.as_deref().unwrap_or(""),
+                host = request_context.host.as_deref().unwrap_or(""),
+                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+                "notify_push websocket connection limit exceeded"
+            );
             let _ = socket
                 .send(Message::text("err: Too many connections"))
                 .await;

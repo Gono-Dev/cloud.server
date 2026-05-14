@@ -6,7 +6,10 @@ use std::{
 use axum::{
     Router,
     extract::{Path, State, WebSocketUpgrade, connect_info::ConnectInfo},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, HOST, USER_AGENT},
+    },
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -44,8 +47,8 @@ pub async fn ws_handler(
     let Some(runtime) = state.notify_push.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let peer_addr = peer_addr_string(&headers, peer_addr);
-    ws.on_upgrade(move |socket| websocket::handle_socket(socket, state, runtime, peer_addr))
+    let request_context = websocket_request_context(&headers, peer_addr);
+    ws.on_upgrade(move |socket| websocket::handle_socket(socket, state, runtime, request_context))
 }
 
 fn peer_addr_string(headers: &HeaderMap, peer_addr: SocketAddr) -> String {
@@ -65,6 +68,29 @@ fn peer_addr_string(headers: &HeaderMap, peer_addr: SocketAddr) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| peer_addr.to_string())
+}
+
+fn websocket_request_context(
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+) -> websocket::WebSocketRequestContext {
+    websocket::WebSocketRequestContext {
+        peer_addr: peer_addr_string(headers, peer_addr),
+        user_agent: header_value(headers, USER_AGENT.as_str()),
+        origin: header_value(headers, "origin"),
+        host: header_value(headers, HOST.as_str()),
+        x_forwarded_for: header_value(headers, "x-forwarded-for"),
+        forwarded: header_value(headers, "forwarded"),
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 async fn pre_auth(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
