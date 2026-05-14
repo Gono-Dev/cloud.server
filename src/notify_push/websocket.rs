@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use tokio::{sync::broadcast, time};
-use tracing::{debug, info, warn};
+use tracing::{Level, debug, info, warn};
 
 use crate::{auth::Principal, notify_push::runtime::SubscribeError, permissions, state::AppState};
 
@@ -19,6 +19,67 @@ pub struct WebSocketRequestContext {
     pub host: Option<String>,
     pub x_forwarded_for: Option<String>,
     pub forwarded: Option<String>,
+}
+
+fn log_authentication_failed(request_context: &WebSocketRequestContext, message: &str) {
+    if tracing::enabled!(Level::DEBUG) {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+            origin = request_context.origin.as_deref().unwrap_or(""),
+            host = request_context.host.as_deref().unwrap_or(""),
+            x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+            forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+            message,
+            "notify_push websocket authentication failed"
+        );
+    } else {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            message,
+            "notify_push websocket authentication failed"
+        );
+    }
+}
+
+fn log_authentication_timed_out(request_context: &WebSocketRequestContext) {
+    if tracing::enabled!(Level::DEBUG) {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+            origin = request_context.origin.as_deref().unwrap_or(""),
+            host = request_context.host.as_deref().unwrap_or(""),
+            x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+            forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+            "notify_push websocket authentication timed out"
+        );
+    } else {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            "notify_push websocket authentication timed out"
+        );
+    }
+}
+
+fn log_connection_limit_exceeded(request_context: &WebSocketRequestContext, user: &str) {
+    if tracing::enabled!(Level::DEBUG) {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            user,
+            user_agent = request_context.user_agent.as_deref().unwrap_or(""),
+            origin = request_context.origin.as_deref().unwrap_or(""),
+            host = request_context.host.as_deref().unwrap_or(""),
+            x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
+            forwarded = request_context.forwarded.as_deref().unwrap_or(""),
+            "notify_push websocket connection limit exceeded"
+        );
+    } else {
+        warn!(
+            peer_addr = %request_context.peer_addr,
+            user,
+            "notify_push websocket connection limit exceeded"
+        );
+    }
 }
 
 pub async fn handle_socket(
@@ -37,30 +98,13 @@ pub async fn handle_socket(
         Ok(Ok(user)) => user,
         Ok(Err(message)) => {
             runtime.auth_failed();
-            warn!(
-                %peer_addr,
-                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
-                origin = request_context.origin.as_deref().unwrap_or(""),
-                host = request_context.host.as_deref().unwrap_or(""),
-                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
-                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
-                message,
-                "notify_push websocket authentication failed"
-            );
+            log_authentication_failed(&request_context, message);
             let _ = socket.send(Message::text(format!("err: {message}"))).await;
             return;
         }
         Err(_) => {
             runtime.auth_failed();
-            warn!(
-                %peer_addr,
-                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
-                origin = request_context.origin.as_deref().unwrap_or(""),
-                host = request_context.host.as_deref().unwrap_or(""),
-                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
-                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
-                "notify_push websocket authentication timed out"
-            );
+            log_authentication_timed_out(&request_context);
             let _ = socket
                 .send(Message::text("err: Authentication timeout"))
                 .await;
@@ -73,16 +117,7 @@ pub async fn handle_socket(
         Ok(receiver) => receiver,
         Err(SubscribeError::LimitExceeded) => {
             runtime.auth_failed();
-            warn!(
-                %peer_addr,
-                user,
-                user_agent = request_context.user_agent.as_deref().unwrap_or(""),
-                origin = request_context.origin.as_deref().unwrap_or(""),
-                host = request_context.host.as_deref().unwrap_or(""),
-                x_forwarded_for = request_context.x_forwarded_for.as_deref().unwrap_or(""),
-                forwarded = request_context.forwarded.as_deref().unwrap_or(""),
-                "notify_push websocket connection limit exceeded"
-            );
+            log_connection_limit_exceeded(&request_context, &user);
             let _ = socket
                 .send(Message::text("err: Too many connections"))
                 .await;
